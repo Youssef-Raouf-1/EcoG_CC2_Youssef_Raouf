@@ -1,0 +1,263 @@
+---
+title: "CC2_EcoG2"
+output:
+   github_document:
+     toc: true
+     toc_depth: 2
+---
+
+# Dada2
+```{r message=FALSE, warning=FALSE}
+library("rmarkdown")
+library("knitr")
+```
+
+
+
+```{r message=FALSE, warning=FALSE}
+library(dada2)
+library(ggplot2)
+library(gridExtra)
+library(phyloseq)
+library(DECIPHER)
+library(phangorn)
+library(Biostrings)
+```
+
+
+```{r}
+miseq_path <- "~/EcoG_CC2_Youssef_Raouf/St_Stratif_10sept14_et_11_mars_15" # CHANGE ME to the directory containing the fastq files after unzipping.
+list.files(miseq_path)
+```
+
+
+#pour 10sept14 et 11mars15
+```{r}
+fnFs <- sort(list.files(miseq_path, pattern="_R1.fastq", full.names = TRUE))
+fnRs <- sort(list.files(miseq_path, pattern="_R2.fastq", full.names = TRUE))
+sample.names <- sapply(strsplit(basename(fnFs), "_R"), `[`, 1)
+sample.names
+```
+
+
+
+```{r}
+plotQualityProfile(fnFs[1:2])
+```
+
+
+
+```{r}
+plotQualityProfile(fnRs[1:2])
+```
+
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(miseq_path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(miseq_path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(250,190), trimLeft = c(21,21),
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+head(out)
+```
+
+```{r message=FALSE, warning=FALSE}
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+```
+
+# Learn the Error Rates
+
+
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE)
+```
+
+```{r}
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+```
+
+```{r}
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+```
+
+```{r}
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+```
+
+```{r}
+dadaFs[[1]]
+```
+
+# Construct sequence table and remove chimeras
+
+```{r}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+
+```{r}
+seqtabAll <- makeSequenceTable(mergers[!grepl("Mock", names(mergers))])
+table(nchar(getSequences(seqtabAll)))
+```
+
+# Remove chimeras
+```{r}
+seqtabNoC <- removeBimeraDenovo(seqtabAll)
+```
+
+# Track reads through the pipeline
+
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtabNoC))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+# Assign taxonomy
+```{r}
+taxa <- assignTaxonomy(seqtabNoC, "~/EcoG_CC2_Youssef_Raouf/silva_nr99_v138_train_set.fa.gz", multithread=TRUE)
+```
+
+```{r}
+taxa <- addSpecies(taxa, "~/EcoG_CC2_Youssef_Raouf/silva_species_assignment_v138.fa.gz")
+```
+
+
+```{r}
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+# Combine data into a phyloseq object
+
+```{r}
+samdf <-read.table('~/EcoG_CC2_Youssef_Raouf/samdf.csv', sep=',', header=TRUE, row.names=1)
+```
+
+
+```{r}
+ps <- phyloseq(otu_table(seqtabNoC, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa))
+ps
+```
+
+
+```{r message=FALSE, warning=FALSE}
+plot_richness(ps, x="Date", measures=c("Shannon", "Simpson"), color="Profondeur")
+```
+
+#taxonomie filtring
+
+```{r}
+rank_names(ps)
+```
+
+
+```{r}
+table(tax_table(ps)[, "Phylum"], exclude = NULL)
+```
+
+```{r}
+ps <- subset_taxa(ps, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+```
+
+```{r}
+# Compute prevalence of each feature, store as data.frame
+prevdf = apply(X = otu_table(ps),
+               MARGIN = ifelse(taxa_are_rows(ps), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf = data.frame(Prevalence = prevdf,
+                    TotalAbundance = taxa_sums(ps),
+                    tax_table(ps))
+```
+
+```{r}
+plyr::ddply(prevdf, "Phylum", function(df1){cbind(mean(df1$Prevalence),sum(df1$Prevalence))})
+```
+
+#Prevalence Filtering
+
+```{r}
+# Subset to the remaining phyla
+prevdf1 = subset(prevdf, Phylum %in% get_taxa_unique(ps, "Phylum"))
+ggplot(prevdf1, aes(TotalAbundance, Prevalence / nsamples(ps),color=Phylum)) +
+  # Include a guess for parameter
+  geom_hline(yintercept = 0.05, alpha = 0.5, linetype = 2) +  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") +
+  facet_wrap(~Phylum) + theme(legend.position="none")
+```
+```{r}
+ggsave("pcoa.jpg", width = 250, height = 100, units = "mm")
+```
+
+
+```{r}
+pslog <- transform_sample_counts(ps, function(x) log(1 + x))
+out.wuf.log <- ordinate(pslog, method = "PCoA", distance = "bray")
+```
+
+```{r}
+evals <- out.wuf.log$values$Eigenvalues
+plot_ordination(pslog, out.wuf.log, color = "Profondeur", shape="Date") +
+  labs(col = "Profondeur",shape= "Date")
+
+```
+
+<span style="color:red">Figure 1: Une matrice PcoA (Principal coordinate analysis) de dissimilarité et similarité relative avec l'indice de Bray curtis, des 8 isolats de bactéries en fonction de la profondeur et de la saison.</span>
+
+<span style="color:blue">Cette figure présente, une dissimilarité entre les communautés d’été et d’hiver car les communautés sont relativement plus dispersées (l’indice tend vers 1) et en fonction des profondeurs avec des différences significatives les communautés de surface et de médiane sont plus proches entre elles que les communautés de fond et qu’en hiver il y a une similarité  entre les communautés de surface et de fond car elles sont étroitement groupées (l’indice tend vers 0) et il n’y a pas de différences significatives, et qu'il y a pas de communautés de médiane.On pourrait dire que sous l'influence de la température en hiver le Métamorphisme des minéraux les rend plus abandon fond qu’en médiane et plus faible surface ce qui est l'inverse en été, donc la présence des communautés de fond peut être dû à la force de mouvement d’eau ce qui rends les minéraux disponibles au fond aussi.</span>
+
+```{r}
+ggsave("abondance.jpg", width = 150, height = 100, units = "mm")
+```
+
+
+```{r}
+top20 <- names(sort(taxa_sums(ps), decreasing=TRUE))[1:20]
+ps.top20 <- transform_sample_counts(ps, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+plot_bar(ps.top20, x="Date", fill="Genus") + facet_wrap(~Profondeur, scales="free_x")
+```
+
+<span style="color:red">Figure 2: Diagramme à barres, montre l'abondance relative des 8 isolats de bactéries en fonction de la profondeur et de la saison.</span>
+
+
+```{r}
+top20 <- names(sort(taxa_sums(ps), decreasing=TRUE))[1:20]
+ps.top20 <- transform_sample_counts(ps, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+plot_bar(ps.top20, x="Profondeur", fill="Genus") + facet_wrap(~Date, scales="free_x")
+```
+
+<span style="color:red">Figure 3: Diagramme à barres, montre l'abondance relative des 8 isolats de bactéries en fonction de la profondeur et de la saison.</span>
+
+<span style="color:blue">A partir des deux diagrammes précèdent (figures 2 et 3), ils montrent l'abondance relative des 8 isolats de bactéries en fonction de l’influence relative de la profondeur et de la saison sur leurs structures des communautés planctoniques. En septembre (été), l’abondance de Clade la, NS4 marine group, SUP05 cluster et Synechococcus CC9902 sont élevé dans toutes les profondeurs sauf que SUP05 cluster est absente en médian et en surface même si elle est présente une l'abondance relative élevé au Fond, mais en mars (hiver) cette dernière est présente une abondance relative élevé au fond et en surface de même pour Clade la et Candidatus Actinomarina. Donc on peut conclure que Clade la, NS4 marine group et Synechococcus CC9902 sont des biomarqueurs d’été et que SUP05 cluster, Clade la et Candidatus Actinomarina sont des biomarqueurs d’hiver. On pourrait dire que Clade la, possède un mécanisme d'adaptation aux changements de température et de pression, ce qui explique qu’elle soit très abondante dans les différentes profondeurs que se soit en été ou en hiver, sauf qu’en hiver elle ne se trouve pas en médiane ce qui pourrais être une question de préférence d’intensité lumineuse en cas de présence.</span>
+
+
+```{r}
+ggsave("abondance1.jpg", width = 150, height = 100, units = "mm")
+
+```
+
+
